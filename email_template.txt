@@ -1,0 +1,15 @@
+Subject: Internship Application – {{ position | default("Software Engineer Intern") }}
+
+Dear {{ company_name | default("Hiring Team") }},
+
+I hope you're doing well.
+
+I am reaching out to express my keen interest in a {{ position | default("Software Engineering internship") }} opportunity with {{ company_name | default("your organization") }}.
+
+With hands-on experience in full-stack development, AI integration, and scalable system design using React, Python, and modern backend technologies, I would love the opportunity to contribute as a {{ position | default("Software Engineer Intern") }} and help build impactful solutions.
+
+My resume is attached for your review. Thank you for your time and consideration — I would be glad to discuss how my background aligns with {{ company_name | default("your organization") }}'s current projects and goals.
+
+Warm regards,
+Adithya Narayan
+GitHub: https://github.com/Adithyanarayan23
