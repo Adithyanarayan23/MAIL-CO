@@ -1,6 +1,6 @@
 Subject: Internship Application – {{ position | default("Software Engineer Intern") }}
 
-Dear {{ company_name | default("Hiring Team") }},
+Dear {{ name | default(company_name | default("Hiring Team")) }},
 
 I hope you're doing well.
 

@@ -359,33 +359,36 @@ def get_campaigns():
 @app.route('/api/campaigns', methods=['POST'])
 def create_campaign():
     """Create a new campaign"""
-    data = request.json
+    data = request.json or {}
     campaigns = load_campaigns()
-    
+
+    campaign_name = _clean_cell_value(data.get("name"))
+    if not campaign_name:
+        return jsonify({"error": "Campaign name is required"}), 400
+
+    normalized_recipients = _normalize_recipients_list(data.get("recipients", []))
+    if not normalized_recipients:
+        return jsonify({"error": "At least one valid recipient email is required"}), 400
+
     new_campaign = {
         "id": int(time.time() * 1000),
-        "name": data.get("name"),
-        "recipients": data.get("recipients", []),
-        "attachResume": data.get("attachResume", False),
+        "name": campaign_name,
+        "recipients": normalized_recipients,
+        "attachResume": bool(data.get("attachResume", False)),
         "status": "draft",
         "createdAt": datetime.now().isoformat(),
         "emails": [],
         "stats": {
-            "total": len(data.get("recipients", [])),
+            "total": len(normalized_recipients),
             "sent": 0,
             "opened": 0,
             "replied": 0
         }
     }
-    
-    # Parse recipients if CSV/Excel uploaded
-    if data.get("fileUploaded"):
-        # In a real implementation, parse the uploaded file
-        pass
-    
+
     campaigns.append(new_campaign)
     save_campaigns(campaigns)
-    
+
     return jsonify(new_campaign), 201
 
 @app.route('/api/campaigns/<int:campaign_id>', methods=['GET'])
@@ -432,34 +435,41 @@ def send_campaign(campaign_id):
     failed_count = 0
     
     # Send emails
-    for recipient in campaign["recipients"]:
-        # Parse recipient (could be email or dict with company info)
-        if isinstance(recipient, dict):
-            email = recipient.get("email", recipient.get("Email", ""))
-            company = recipient.get("company", recipient.get("Company Name", ""))
-            industry = recipient.get("industry", recipient.get("Industry", ""))
-            position = recipient.get("position", recipient.get("Position", ""))
-            location = recipient.get("location", recipient.get("Location", ""))
-        else:
-            email = str(recipient).strip()
-            company = email.split("@")[0] if "@" in email else "Company"
-            industry = ""
-            position = ""
-            location = ""
-        
-        if not email or "@" not in email:
+    for recipient in campaign.get("recipients", []):
+        # Parse recipient (supports structured recipient dicts and legacy string recipients)
+        parsed_recipient = _normalize_recipient_entry(recipient)
+        if not parsed_recipient:
             continue
-        
-        # Prepare template context
+
+        email = parsed_recipient["email"]
+        name = parsed_recipient["name"]
+        company = parsed_recipient["company"]
+        position = parsed_recipient["position"]
+        industry = parsed_recipient["industry"]
+        location = parsed_recipient["location"]
+
+        # Prepare template context (populate recipient fields only when present so Jinja default() filters work)
         context = {
-            "company_name": company or "Team",
-            "industry": industry or "your field",
-            "position": position or "internship",
-            "location": location or "",
             "interest": "AI and Web Development",
             "skills": "Python, Machine Learning, and Web Development"
         }
-        
+        if name:
+            context["name"] = name
+            context["Name"] = name
+        if company:
+            context["company_name"] = company
+            context["company"] = company
+            context["Company"] = company
+        if position:
+            context["position"] = position
+            context["Position"] = position
+        if industry:
+            context["industry"] = industry
+            context["Industry"] = industry
+        if location:
+            context["location"] = location
+            context["Location"] = location
+
         rendered = template.render(**context)
         
         # Split subject and body
@@ -557,11 +567,154 @@ def get_analytics():
         "replyRate": (total_replied / total_sent * 100) if total_sent > 0 else 0
     })
 
+RECIPIENT_HEADER_ALIASES = {
+    "email": [
+        "email",
+        "email address",
+        "e-mail",
+        "e-mail address",
+        "mail",
+        "recipient email",
+        "contact email",
+    ],
+    "name": [
+        "name",
+        "full name",
+        "recruiter name",
+        "contact name",
+        "recipient name",
+        "person",
+    ],
+    "company": [
+        "company",
+        "company name",
+        "organization",
+        "organisation",
+        "employer",
+        "firm",
+    ],
+    "position": [
+        "position",
+        "role",
+        "job title",
+        "title",
+        "target role",
+        "designation",
+    ],
+    "industry": [
+        "industry",
+        "sector",
+        "domain",
+        "vertical",
+    ],
+    "location": [
+        "location",
+        "city",
+        "country",
+        "address",
+        "region",
+        "office",
+    ],
+}
+
 def _clean_cell_value(val):
-    """Convert pandas cell value to clean string, handling NaN/None"""
-    if val is None or pd.isna(val):
+    """Convert cell/JSON value to clean string, handling NaN/None"""
+    if val is None:
         return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except Exception:
+        pass
     return str(val).strip()
+
+def _normalize_header(col_name):
+    """Normalize spreadsheet header by trimming, lowercasing, and collapsing whitespace"""
+    if col_name is None:
+        return ""
+    return " ".join(str(col_name).strip().lower().split())
+
+def _is_valid_recipient_email(email_addr):
+    """Validate basic recipient email format and block header injection characters"""
+    if not email_addr or "@" not in email_addr:
+        return False
+    if any(ch in email_addr for ch in ("\r", "\n", " ", "\t")):
+        return False
+    local_part, _, domain_part = email_addr.partition("@")
+    return bool(local_part and domain_part and "." in domain_part)
+
+def _normalize_recipient_entry(entry):
+    """Normalize a string or dict recipient into canonical structured dict, or None if invalid"""
+    if isinstance(entry, dict):
+        normalized_map = {}
+        for k, v in entry.items():
+            norm_k = _normalize_header(k)
+            cleaned_v = _clean_cell_value(v)
+            if norm_k and cleaned_v and norm_k not in normalized_map:
+                normalized_map[norm_k] = cleaned_v
+
+        def pick(field):
+            for alias in RECIPIENT_HEADER_ALIASES[field]:
+                if normalized_map.get(alias):
+                    return normalized_map[alias]
+            return ""
+
+        email_addr = pick("email")
+        if not _is_valid_recipient_email(email_addr):
+            return None
+
+        name_val = pick("name")
+        if not name_val:
+            first = normalized_map.get("first name", "")
+            last = normalized_map.get("last name", "")
+            name_val = " ".join(part for part in (first, last) if part)
+
+        return {
+            "email": email_addr,
+            "name": name_val,
+            "company": pick("company"),
+            "position": pick("position"),
+            "industry": pick("industry"),
+            "location": pick("location"),
+        }
+
+    if isinstance(entry, str):
+        email_addr = _clean_cell_value(entry)
+        if not _is_valid_recipient_email(email_addr):
+            return None
+        return {
+            "email": email_addr,
+            "name": "",
+            "company": "",
+            "position": "",
+            "industry": "",
+            "location": "",
+        }
+
+    return None
+
+def _normalize_recipients_list(raw_recipients):
+    """Normalize and deduplicate a list of recipients while preserving field values"""
+    if not isinstance(raw_recipients, list):
+        return []
+
+    by_email = {}
+    ordered_keys = []
+    for item in raw_recipients:
+        parsed = _normalize_recipient_entry(item)
+        if not parsed:
+            continue
+        key = parsed["email"].lower()
+        if key not in by_email:
+            by_email[key] = parsed
+            ordered_keys.append(key)
+        else:
+            existing = by_email[key]
+            for field in ("name", "company", "position", "industry", "location"):
+                if not existing[field] and parsed[field]:
+                    existing[field] = parsed[field]
+
+    return [by_email[k] for k in ordered_keys]
 
 @app.route('/api/recipients/upload', methods=['POST'])
 def upload_recipients():
@@ -597,24 +750,9 @@ def upload_recipients():
         except Exception as e:
             return jsonify({"error": f"Error reading file: {str(e)}"}), 400
 
-        # Extract recipients
-        recipients = []
-        for _, row in df.iterrows():
-            raw_email = row.get("Email") if "Email" in row and not pd.isna(row.get("Email")) else row.get("email", "")
-            email_addr = _clean_cell_value(raw_email)
-            if email_addr and "@" in email_addr and not any(ch in email_addr for ch in ('\r', '\n', ' ')):
-                raw_company = row.get("Company Name") if "Company Name" in row and not pd.isna(row.get("Company Name")) else row.get("company", "")
-                raw_industry = row.get("Industry") if "Industry" in row and not pd.isna(row.get("Industry")) else row.get("industry", "")
-                raw_position = row.get("Position") if "Position" in row and not pd.isna(row.get("Position")) else row.get("position", "")
-                raw_location = row.get("Location") if "Location" in row and not pd.isna(row.get("Location")) else row.get("location", "")
-                recipient = {
-                    "email": email_addr,
-                    "company": _clean_cell_value(raw_company),
-                    "industry": _clean_cell_value(raw_industry),
-                    "position": _clean_cell_value(raw_position),
-                    "location": _clean_cell_value(raw_location)
-                }
-                recipients.append(recipient)
+        # Extract and normalize structured recipients using header alias mapping
+        raw_rows = df.to_dict(orient='records')
+        recipients = _normalize_recipients_list(raw_rows)
 
         return jsonify({
             "success": True,
