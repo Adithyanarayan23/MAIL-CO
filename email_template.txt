@@ -8,7 +8,7 @@ I am reaching out to express my keen interest in a {{ position | default("Softwa
 
 With hands-on experience in full-stack development, AI integration, and scalable system design using React, Python, and modern backend technologies, I would love the opportunity to contribute as a {{ position | default("Software Engineer Intern") }} and help build impactful solutions.
 
-My resume is attached for your review. Thank you for your time and consideration — I would be glad to discuss how my background aligns with {{ company_name | default("your organization") }}'s current projects and goals.
+{% if resume_attached %}My resume is attached for your review. {% endif %}Thank you for your time and consideration — I would be glad to discuss how my background aligns with {{ company_name | default("your organization") }}'s current projects and goals.
 
 Warm regards,
 Adithya Narayan

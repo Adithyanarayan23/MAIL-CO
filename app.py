@@ -244,6 +244,46 @@ def extract_template_subject_pattern():
 #             "interests": "Error extracting"
 #         }
 
+def _format_file_size(file_size):
+    """Format byte count into a consistent user-friendly size string"""
+    if file_size < 1024:
+        return f"{file_size} B"
+    if file_size < 1024 * 1024:
+        return f"{file_size / 1024:.1f} KB"
+    return f"{file_size / (1024 * 1024):.2f} MB"
+
+def _resolve_safe_resume_path(filename):
+    """Resolve a PDF filename strictly inside RESUME_FOLDER, or return None"""
+    safe_name = secure_filename(filename or "")
+    if not safe_name or not safe_name.lower().endswith('.pdf'):
+        return None
+    resume_dir = os.path.abspath(RESUME_FOLDER)
+    candidate = os.path.abspath(os.path.join(resume_dir, safe_name))
+    if not candidate.startswith(resume_dir + os.sep):
+        return None
+    return candidate
+
+def _list_resume_files():
+    """Return full paths of all valid PDF files strictly inside RESUME_FOLDER"""
+    resume_dir = os.path.abspath(RESUME_FOLDER)
+    if not os.path.isdir(resume_dir):
+        return []
+    files = []
+    for entry in os.listdir(resume_dir):
+        if not entry.lower().endswith('.pdf'):
+            continue
+        full_path = os.path.abspath(os.path.join(resume_dir, entry))
+        if full_path.startswith(resume_dir + os.sep) and os.path.isfile(full_path):
+            files.append(full_path)
+    return files
+
+def _get_active_resume_path():
+    """Return full path to the currently active PDF resume, or None"""
+    resumes = _list_resume_files()
+    if not resumes:
+        return None
+    return max(resumes, key=os.path.getmtime)
+
 def send_email_smtp(receiver_email, subject, body, attachment_path=None):
     """Send email via SMTP"""
     msg = MIMEMultipart()
@@ -252,7 +292,9 @@ def send_email_smtp(receiver_email, subject, body, attachment_path=None):
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    if attachment_path and os.path.exists(attachment_path):
+    if attachment_path is not None:
+        if not os.path.isfile(attachment_path):
+            raise FileNotFoundError("Requested attachment file was not found")
         with open(attachment_path, "rb") as f:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
@@ -272,7 +314,7 @@ def health():
 
 @app.route('/api/resume/upload', methods=['POST'])
 def upload_resume():
-    """Upload resume and extract metadata"""
+    """Upload active PDF resume, replacing any previous active resume"""
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
@@ -280,59 +322,69 @@ def upload_resume():
     if not file or not file.filename or file.filename.strip() == '':
         return jsonify({"error": "No file selected"}), 400
 
-    filename = secure_filename(file.filename)
-    if not filename or not filename.lower().endswith('.pdf'):
+    target_path = _resolve_safe_resume_path(file.filename)
+    if not target_path:
         return jsonify({"error": "Invalid file type. Only PDF allowed"}), 400
 
-    # Verify PDF magic header bytes (%PDF-)
+    # Verify PDF magic header bytes (%PDF-) before modifying existing files
     header = file.stream.read(5)
     file.stream.seek(0)
     if header != b'%PDF-':
         return jsonify({"error": "Invalid PDF file content"}), 400
 
-    filepath = os.path.join(RESUME_FOLDER, filename)
-    file.save(filepath)
+    os.makedirs(RESUME_FOLDER, exist_ok=True)
+    temp_path = os.path.abspath(os.path.join(RESUME_FOLDER, f".upload_{int(time.time() * 1000)}.tmp"))
+    try:
+        file.save(temp_path)
+        file_size = os.path.getsize(temp_path)
+        if file_size == 0:
+            os.remove(temp_path)
+            return jsonify({"error": "Uploaded PDF file is empty"}), 400
 
-    # Determine file size
-    file_size = os.path.getsize(filepath)
-    if file_size == 0:
-        os.remove(filepath)
-        return jsonify({"error": "Uploaded PDF file is empty"}), 400
+        os.replace(temp_path, target_path)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
 
-    size_str = f"{file_size / 1024:.1f} KB"
-    if file_size > 1024 * 1024:
-        size_str = f"{file_size / (1024 * 1024):.1f} MB"
+    # Enforce single active resume: remove any previous PDF resumes in RESUME_FOLDER
+    target_norm = os.path.normcase(target_path)
+    for existing_path in _list_resume_files():
+        if os.path.normcase(existing_path) != target_norm:
+            try:
+                os.remove(existing_path)
+            except OSError:
+                pass
 
-    uploaded_at = datetime.now().isoformat()
+    filename = os.path.basename(target_path)
+    file_size = os.path.getsize(target_path)
+    uploaded_at = datetime.fromtimestamp(os.path.getmtime(target_path)).isoformat()
+
     return jsonify({
         "success": True,
         "name": filename,
         "filename": filename,
-        "filepath": filepath,
-        "size": size_str,
+        "filepath": os.path.join(RESUME_FOLDER, filename),
+        "size": _format_file_size(file_size),
         "uploadedAt": uploaded_at,
         "metadata": None
     })
 
 @app.route('/api/resume', methods=['GET'])
 def get_resume():
-    """Get current resume info"""
-    resumes = [f for f in os.listdir(RESUME_FOLDER) if f.lower().endswith('.pdf')]
-    if resumes:
-        latest_resume = max(resumes, key=lambda f: os.path.getmtime(os.path.join(RESUME_FOLDER, f)))
-        filepath = os.path.join(RESUME_FOLDER, latest_resume)
-        # metadata = extract_resume_metadata_with_gemini(filepath)
-        file_size = os.path.getsize(filepath)
-        size_str = f"{file_size / 1024:.1f} KB"
-        if file_size > 1024 * 1024:
-            size_str = f"{file_size / (1024 * 1024):.1f} MB"
+    """Get current active resume info"""
+    active_path = _get_active_resume_path()
+    if active_path:
+        filename = os.path.basename(active_path)
+        file_size = os.path.getsize(active_path)
+        uploaded_at = datetime.fromtimestamp(os.path.getmtime(active_path)).isoformat()
 
         return jsonify({
-            "name": latest_resume,
-            "filename": latest_resume,
-            "filepath": filepath,
-            "size": size_str,
-            "uploadedAt": datetime.fromtimestamp(os.path.getmtime(filepath)).isoformat(),
+            "name": filename,
+            "filename": filename,
+            "filepath": os.path.join(RESUME_FOLDER, filename),
+            "size": _format_file_size(file_size),
+            "uploadedAt": uploaded_at,
             "metadata": None
         })
 
@@ -340,15 +392,24 @@ def get_resume():
 
 @app.route('/api/resume/<filename>', methods=['DELETE'])
 def delete_resume(filename):
-    """Delete resume"""
-    safe_name = secure_filename(filename)
-    if not safe_name or not safe_name.lower().endswith('.pdf'):
+    """Delete active resume and clear any orphaned resume PDFs"""
+    target_path = _resolve_safe_resume_path(filename)
+    if not target_path:
         return jsonify({"error": "Invalid filename"}), 400
-    filepath = os.path.join(RESUME_FOLDER, safe_name)
-    if os.path.exists(filepath):
-        os.remove(filepath)
-        return jsonify({"success": True})
-    return jsonify({"error": "File not found"}), 404
+
+    if not os.path.isfile(target_path):
+        return jsonify({"error": "File not found"}), 404
+
+    os.remove(target_path)
+
+    # Ensure no older orphaned PDF resumes remain active after deletion
+    for remaining_path in _list_resume_files():
+        try:
+            os.remove(remaining_path)
+        except OSError:
+            pass
+
+    return jsonify({"success": True})
 
 @app.route('/api/campaigns', methods=['GET'])
 def get_campaigns():
@@ -420,13 +481,16 @@ def send_campaign(campaign_id):
     with open(template_path, "r", encoding="utf-8") as f:
         template = Template(f.read())
     
-    # Get resume path if needed
+    # Resolve active resume path when attachment is enabled
+    attach_resume_enabled = bool(campaign.get("attachResume", False))
     resume_path = None
-    if campaign.get("attachResume"):
-        resumes = [f for f in os.listdir(RESUME_FOLDER) if f.endswith('.pdf')]
-        if resumes:
-            resume_path = os.path.join(RESUME_FOLDER, max(resumes, key=lambda f: os.path.getmtime(os.path.join(RESUME_FOLDER, f))))
-    
+    if attach_resume_enabled:
+        resume_path = _get_active_resume_path()
+        if not resume_path:
+            return jsonify({
+                "error": "Resume attachment is enabled for this campaign, but no resume is currently uploaded. Please upload a PDF resume in Profile & Resume first."
+            }), 400
+
     # Update campaign status
     campaign["status"] = "sending"
     save_campaigns(campaigns)
@@ -451,7 +515,8 @@ def send_campaign(campaign_id):
         # Prepare template context (populate recipient fields only when present so Jinja default() filters work)
         context = {
             "interest": "AI and Web Development",
-            "skills": "Python, Machine Learning, and Web Development"
+            "skills": "Python, Machine Learning, and Web Development",
+            "resume_attached": bool(resume_path),
         }
         if name:
             context["name"] = name
@@ -483,15 +548,16 @@ def send_campaign(campaign_id):
         subject = subject_line.replace("Subject:", "").strip()
         
         try:
-            send_email_smtp(email, subject, body, resume_path if campaign.get("attachResume") else None)
+            send_email_smtp(email, subject, body, resume_path)
             sent_count += 1
             campaign["stats"]["sent"] = sent_count
-            
+
             # Log email
             email_record = {
                 "id": int(time.time() * 1000) + sent_count,
                 "recipient": email,
                 "status": "sent",
+                "resumeAttached": bool(resume_path),
                 "sentAt": datetime.now().isoformat()
             }
             campaign["emails"].append(email_record)
@@ -531,12 +597,14 @@ def send_campaign(campaign_id):
             campaign["emails"].append(email_record)
     
     campaign["status"] = "completed"
+    campaign["resumeAttached"] = bool(resume_path)
     save_campaigns(campaigns)
-    
+
     return jsonify({
         "success": True,
         "sent": sent_count,
         "failed": failed_count,
+        "resumeAttached": bool(resume_path),
         "campaign": campaign
     })
 

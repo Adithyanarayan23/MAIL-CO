@@ -73,6 +73,10 @@ async function apiRequest(endpoint, options = {}) {
 
 // Profile/Resume Page
 function ProfilePage({ resume, resumeLoading, onResumeUpload, onResumeRemove }) {
+  const uploadedDateLabel = resume?.uploadedAt
+    ? new Date(resume.uploadedAt).toLocaleDateString()
+    : '';
+
   return (
     <div className="flex-1 overflow-y-auto p-8">
       <div className="max-w-4xl mx-auto">
@@ -87,12 +91,12 @@ function ProfilePage({ resume, resumeLoading, onResumeUpload, onResumeRemove }) 
               <Upload className="w-12 h-12 text-gray-400 mx-auto mb-4" />
               <p className="text-gray-600 mb-4">Upload your resume (PDF only)</p>
               {resumeLoading ? (
-                <p className="text-blue-600">Uploading and extracting metadata...</p>
+                <p className="text-blue-600">Uploading resume...</p>
               ) : (
                 <label className="inline-block">
                   <input
                     type="file"
-                    accept=".pdf"
+                    accept=".pdf,application/pdf"
                     onChange={onResumeUpload}
                     className="hidden"
                     disabled={resumeLoading}
@@ -110,13 +114,28 @@ function ProfilePage({ resume, resumeLoading, onResumeUpload, onResumeRemove }) 
                   <FileText className="w-8 h-8 text-red-600" />
                   <div>
                     <p className="font-medium text-gray-900">{resume.name}</p>
-                    <p className="text-sm text-gray-500">{resume.size} • Uploaded {new Date(resume.uploadedAt).toLocaleDateString()}</p>
+                    <p className="text-sm text-gray-500">
+                      {resume.size}
+                      {uploadedDateLabel ? ` • Uploaded ${uploadedDateLabel}` : ''}
+                    </p>
                   </div>
                 </div>
                 <div className="flex gap-2">
+                  <label className="p-2 hover:bg-blue-50 text-blue-600 rounded flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="file"
+                      accept=".pdf,application/pdf"
+                      onChange={onResumeUpload}
+                      className="hidden"
+                      disabled={resumeLoading}
+                    />
+                    <Upload className="w-4 h-4" />
+                    {resumeLoading ? 'Uploading...' : 'Replace'}
+                  </label>
                   <button
                     onClick={onResumeRemove}
-                    className="p-2 hover:bg-red-50 text-red-600 rounded flex items-center gap-2"
+                    disabled={resumeLoading}
+                    className="p-2 hover:bg-red-50 text-red-600 rounded flex items-center gap-2 disabled:opacity-50"
                   >
                     <Trash2 className="w-4 h-4" />
                     Remove
@@ -130,7 +149,7 @@ function ProfilePage({ resume, resumeLoading, onResumeUpload, onResumeRemove }) 
                 </div>
                 <div>
                   <p className="font-semibold">Ready to Attach</p>
-                  <p>This resume will be automatically attached to emails sent from the Campaigns tab.</p>
+                  <p>This resume will be attached when "Attach Resume as PDF" is enabled on a campaign.</p>
                 </div>
               </div>
             </div>
@@ -142,7 +161,7 @@ function ProfilePage({ resume, resumeLoading, onResumeUpload, onResumeRemove }) 
 }
 
 // Campaign Creation Page
-function CampaignCreationPage({ onCreateCampaign, onCancel }) {
+function CampaignCreationPage({ onCreateCampaign, onCancel, resume }) {
   const [campaignName, setCampaignName] = useState('');
   const [recipients, setRecipients] = useState('');
   const [recipientRecords, setRecipientRecords] = useState({});
@@ -342,9 +361,14 @@ function CampaignCreationPage({ onCreateCampaign, onCancel }) {
               <div>
                 <p className="font-medium text-gray-900">Attach Resume as PDF</p>
                 <p className="text-sm text-gray-500 mt-1">
-                  When enabled, your resume PDF will be directly attached to each email.
-                  Otherwise, a link will be included in the email body (recommended for bulk).
+                  When enabled, your active PDF resume will be attached to each email.
+                  When disabled, emails will be sent without a resume attachment.
                 </p>
+                {attachResume && !resume && (
+                  <p className="text-sm text-amber-600 mt-2">
+                    No resume is currently uploaded. Upload a PDF in Profile &amp; Resume before sending this campaign.
+                  </p>
+                )}
               </div>
             </div>
           </div>
@@ -375,6 +399,7 @@ function CampaignCreationPage({ onCreateCampaign, onCancel }) {
 function CampaignsPage({
   campaigns,
   campaignsLoading,
+  resume,
   onRefresh,
   onNewCampaign,
   onSelectCampaign,
@@ -464,15 +489,22 @@ function CampaignsPage({
 
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2 text-sm text-gray-600">
-                    {campaign.attachResume ? (
-                      <span className="flex items-center gap-1">
-                        <FileText className="w-4 h-4" />
-                        Resume attached as PDF
-                      </span>
+                    {campaign.attachResume && campaign.resumeAttached !== false ? (
+                      campaign.status === 'completed' || resume ? (
+                        <span className="flex items-center gap-1">
+                          <FileText className="w-4 h-4" />
+                          Resume attached as PDF
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-1 text-amber-600">
+                          <AlertCircle className="w-4 h-4" />
+                          Resume attachment enabled (upload PDF before sending)
+                        </span>
+                      )
                     ) : (
                       <span className="flex items-center gap-1">
                         <Mail className="w-4 h-4" />
-                        Resume link included
+                        No resume attached
                       </span>
                     )}
                   </div>
@@ -847,7 +879,6 @@ export default function MailCo() {
 
   // Resume state
   const [resume, setResume] = useState(null);
-  const [resumeMetadata, setResumeMetadata] = useState(null);
   const [resumeLoading, setResumeLoading] = useState(false);
 
   // Campaign state
@@ -914,15 +945,15 @@ export default function MailCo() {
       const data = await apiRequest('/resume');
       if (data) {
         setResume({
-          name: data.filename,
-          size: 'N/A',
-          uploadedAt: new Date().toISOString(),
+          name: data.filename || data.name,
+          size: data.size || '',
+          uploadedAt: data.uploadedAt || null,
         });
-        setResumeMetadata(data.metadata);
       }
     } catch (error) {
       if (error.status === 404) {
         // Resume might not exist yet, that's okay
+        setResume(null);
         console.log('No resume found');
       } else if (!error.message.includes('Failed to fetch')) {
         console.error('Error loading resume:', error);
@@ -950,30 +981,42 @@ export default function MailCo() {
 
   // Resume upload handler
   const handleResumeUpload = async (event) => {
-    const file = event.target.files[0];
-    if (file && file.type === 'application/pdf') {
-      setResumeLoading(true);
-      const formData = new FormData();
-      formData.append('file', file);
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
 
-      try {
-        const data = await apiRequest('/resume/upload', {
-          method: 'POST',
-          body: formData,
-        });
+    const hasPdfExtension = Boolean(file.name && file.name.toLowerCase().endsWith('.pdf'));
+    const normalizedMime = (file.type || '').toLowerCase();
+    const allowedMimeTypes = ['application/pdf', 'application/x-pdf', 'application/octet-stream', ''];
 
-        setResume({
-          name: data.filename,
-          size: (file.size / 1024 / 1024).toFixed(2) + ' MB',
-          uploadedAt: data.uploadedAt,
-        });
-        setResumeMetadata(data.metadata);
-      } catch (error) {
-        console.error('Error uploading resume:', error);
-        alert(error.status ? `Error: ${error.message}` : 'Failed to upload resume');
-      } finally {
-        setResumeLoading(false);
-      }
+    if (!hasPdfExtension || !allowedMimeTypes.includes(normalizedMime)) {
+      alert('Invalid file type. Please upload a PDF file (.pdf).');
+      event.target.value = '';
+      return;
+    }
+
+    setResumeLoading(true);
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const data = await apiRequest('/resume/upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      setResume({
+        name: data.filename || data.name,
+        size: data.size || '',
+        uploadedAt: data.uploadedAt || null,
+      });
+    } catch (error) {
+      console.error('Error uploading resume:', error);
+      alert(error.status ? `Error: ${error.message}` : 'Failed to upload resume');
+    } finally {
+      setResumeLoading(false);
+      event.target.value = '';
     }
   };
 
@@ -981,14 +1024,14 @@ export default function MailCo() {
     if (!resume) return;
 
     try {
-      await apiRequest(`/resume/${resume.name}`, {
+      await apiRequest(`/resume/${encodeURIComponent(resume.name)}`, {
         method: 'DELETE',
       });
 
       setResume(null);
-      setResumeMetadata(null);
     } catch (error) {
       console.error('Error removing resume:', error);
+      alert(error.status ? `Failed to remove resume: ${error.message}` : 'Failed to remove resume');
     }
   };
 
@@ -1192,6 +1235,7 @@ export default function MailCo() {
         <CampaignCreationPage
           onCreateCampaign={handleCreateCampaign}
           onCancel={() => setCurrentPage('campaigns')}
+          resume={resume}
         />
       );
     }
@@ -1200,6 +1244,7 @@ export default function MailCo() {
         <CampaignsPage
           campaigns={campaigns}
           campaignsLoading={campaignsLoading}
+          resume={resume}
           onRefresh={loadCampaigns}
           onNewCampaign={() => setCurrentPage('create-campaign')}
           onSelectCampaign={setSelectedCampaign}
