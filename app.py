@@ -1145,81 +1145,157 @@ def sync_emails():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def _normalize_email_record(item, default_folder='inbox'):
+    """Ensure email/draft record has safe fields for frontend rendering"""
+    if not isinstance(item, dict):
+        return None
+    normalized = dict(item)
+    folder = normalized.get('folder') or default_folder
+    normalized['folder'] = folder
+    body_text = normalized.get('body') or ''
+    normalized['body'] = body_text
+    normalized['subject'] = normalized.get('subject') or '(no subject)'
+    if not normalized.get('sender'):
+        normalized['sender'] = normalized.get('to') or 'Draft' if folder == 'drafts' else 'Unknown'
+    if not normalized.get('email'):
+        normalized['email'] = normalized.get('to') or ''
+    if 'preview' not in normalized or normalized.get('preview') is None:
+        normalized['preview'] = (body_text[:100] + '...') if len(body_text) > 100 else body_text
+    normalized['read'] = bool(normalized.get('read', folder != 'inbox'))
+    normalized['starred'] = bool(normalized.get('starred', False))
+    normalized['time'] = normalized.get('time') or ''
+    return normalized
+
+def _email_matches_id(email_obj, target_id):
+    """Match email by id or gmail_id safely across string and integer IDs"""
+    target_str = str(target_id)
+    item_id = email_obj.get('id')
+    gmail_id = email_obj.get('gmail_id')
+    return (item_id is not None and str(item_id) == target_str) or (
+        gmail_id is not None and str(gmail_id) == target_str
+    )
+
 @app.route('/api/emails', methods=['GET'])
 def get_emails():
-    """Get all emails"""
-    folder = request.args.get('folder', 'inbox')
+    """Get emails by folder ('inbox', 'sent', 'drafts', 'starred', or 'all')"""
+    folder = (request.args.get('folder') or 'inbox').strip().lower()
     emails_data = load_emails()
-    return jsonify(emails_data.get(folder, []))
+
+    if folder in ('starred', 'all'):
+        combined = []
+        seen_keys = set()
+        for f_name in ('inbox', 'sent', 'drafts'):
+            for raw_item in emails_data.get(f_name, []):
+                norm_item = _normalize_email_record(raw_item, default_folder=f_name)
+                if not norm_item:
+                    continue
+                if folder == 'starred' and not norm_item.get('starred'):
+                    continue
+                dedup_key = f"{f_name}:{norm_item.get('gmail_id') or norm_item.get('id')}"
+                if dedup_key not in seen_keys:
+                    seen_keys.add(dedup_key)
+                    combined.append(norm_item)
+        return jsonify(combined)
+
+    folder_items = [
+        norm_item
+        for raw_item in emails_data.get(folder, [])
+        for norm_item in (_normalize_email_record(raw_item, default_folder=folder),)
+        if norm_item is not None
+    ]
+    return jsonify(folder_items)
 
 @app.route('/api/emails/<email_id>/star', methods=['POST'])
 def toggle_star_email(email_id):
     """Toggle star status of an email"""
     service = get_gmail_service()
     emails_data = load_emails()
-    
-    # Find email in all folders
-    email_obj = None
-    folder = None
-    for f in ['inbox', 'sent', 'drafts']:
+
+    # Find email across all folders (string/int safe ID comparison)
+    matched_emails = []
+    gmail_msg_id = None
+    for f in ('inbox', 'sent', 'drafts'):
         for e in emails_data.get(f, []):
-            if e.get('id') == email_id or e.get('gmail_id') == email_id:
-                email_obj = e
-                folder = f
-                break
-        if email_obj:
-            break
-    
-    if not email_obj:
+            if isinstance(e, dict) and _email_matches_id(e, email_id):
+                matched_emails.append(e)
+                if not gmail_msg_id and e.get('gmail_id'):
+                    gmail_msg_id = e.get('gmail_id')
+
+    if not matched_emails:
         return jsonify({"error": "Email not found"}), 404
-    
-    # Toggle star
-    new_starred = not email_obj.get('starred', False)
-    email_obj['starred'] = new_starred
-    
+
+    new_starred = not bool(matched_emails[0].get('starred', False))
+    for e in matched_emails:
+        e['starred'] = new_starred
+
     # Update in Gmail if connected
-    if service and email_obj.get('gmail_id'):
+    if service and gmail_msg_id:
         try:
             if new_starred:
                 service.users().messages().modify(
                     userId='me',
-                    id=email_obj['gmail_id'],
+                    id=gmail_msg_id,
                     body={'addLabelIds': ['STARRED']}
                 ).execute()
             else:
                 service.users().messages().modify(
                     userId='me',
-                    id=email_obj['gmail_id'],
+                    id=gmail_msg_id,
                     body={'removeLabelIds': ['STARRED']}
                 ).execute()
-        except:
+        except Exception:
             pass  # Continue even if Gmail update fails
-    
+
     save_emails(emails_data)
     return jsonify({"success": True, "starred": new_starred})
 
 @app.route('/api/emails/<email_id>/read', methods=['POST'])
 def toggle_read_email(email_id):
-    """Toggle read status of an email"""
+    """Toggle or explicitly set read status of an email"""
+    service = get_gmail_service()
     emails_data = load_emails()
-    
-    # Find email in all folders
-    email_obj = None
-    for f in ['inbox', 'sent', 'drafts']:
+    payload = request.get_json(silent=True) or {}
+
+    matched_emails = []
+    gmail_msg_id = None
+    for f in ('inbox', 'sent', 'drafts'):
         for e in emails_data.get(f, []):
-            if e.get('id') == email_id or e.get('gmail_id') == email_id:
-                email_obj = e
-                break
-        if email_obj:
-            break
-    
-    if not email_obj:
+            if isinstance(e, dict) and _email_matches_id(e, email_id):
+                matched_emails.append(e)
+                if not gmail_msg_id and e.get('gmail_id'):
+                    gmail_msg_id = e.get('gmail_id')
+
+    if not matched_emails:
         return jsonify({"error": "Email not found"}), 404
-    
-    # Toggle read
-    email_obj['read'] = not email_obj.get('read', False)
+
+    if isinstance(payload.get('read'), bool):
+        new_read = payload['read']
+    else:
+        new_read = not bool(matched_emails[0].get('read', False))
+
+    for e in matched_emails:
+        e['read'] = new_read
+
+    # Sync UNREAD label in Gmail when connected
+    if service and gmail_msg_id:
+        try:
+            if new_read:
+                service.users().messages().modify(
+                    userId='me',
+                    id=gmail_msg_id,
+                    body={'removeLabelIds': ['UNREAD']}
+                ).execute()
+            else:
+                service.users().messages().modify(
+                    userId='me',
+                    id=gmail_msg_id,
+                    body={'addLabelIds': ['UNREAD']}
+                ).execute()
+        except Exception:
+            pass  # Continue even if Gmail update fails
+
     save_emails(emails_data)
-    return jsonify({"success": True, "read": email_obj['read']})
+    return jsonify({"success": True, "read": new_read})
 
 @app.route('/api/compose/send', methods=['POST'])
 def send_composed_email():

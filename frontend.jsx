@@ -715,6 +715,9 @@ function AnalyticsPage({ campaigns }) {
 
 // Email View Page
 function EmailViewPage({ selectedEmail, onBack, onToggleRead, onToggleStar }) {
+  const emailKey = selectedEmail.id ?? selectedEmail.gmail_id;
+  const senderInitial = (selectedEmail.sender || '?').charAt(0).toUpperCase();
+
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="border-b border-gray-200 p-2 flex items-center gap-2">
@@ -732,7 +735,8 @@ function EmailViewPage({ selectedEmail, onBack, onToggleRead, onToggleStar }) {
         </button>
         <div className="w-px h-6 bg-gray-300 mx-2" />
         <button
-          onClick={() => onToggleRead(selectedEmail.id)}
+          onClick={() => onToggleRead(emailKey)}
+          title={selectedEmail.read ? 'Mark as unread' : 'Mark as read'}
           className="p-2 hover:bg-gray-100 rounded-full"
         >
           <Mail className="w-5 h-5 text-gray-700" />
@@ -750,18 +754,22 @@ function EmailViewPage({ selectedEmail, onBack, onToggleRead, onToggleStar }) {
 
         <div className="flex items-start gap-4 mb-6">
           <div className="w-10 h-10 rounded-full bg-blue-500 flex items-center justify-center text-white font-medium">
-            {selectedEmail.sender.charAt(0).toUpperCase()}
+            {senderInitial}
           </div>
           <div className="flex-1">
             <div className="flex items-center gap-2">
               <span className="font-medium text-gray-900">{selectedEmail.sender}</span>
-              <span className="text-gray-500 text-sm">&lt;{selectedEmail.email}&gt;</span>
+              {selectedEmail.email && (
+                <span className="text-gray-500 text-sm">&lt;{selectedEmail.email}&gt;</span>
+              )}
             </div>
-            <div className="text-gray-500 text-sm mt-1">to me</div>
+            <div className="text-gray-500 text-sm mt-1">
+              {selectedEmail.folder === 'sent' ? `to ${selectedEmail.email || 'recipient'}` : 'to me'}
+            </div>
           </div>
           <div className="text-gray-500 text-sm">{selectedEmail.time}</div>
           <button
-            onClick={(e) => onToggleStar(selectedEmail.id, e)}
+            onClick={(e) => onToggleStar(emailKey, e)}
             className="p-1 hover:bg-gray-100 rounded-full"
           >
             <Star className={`w-5 h-5 ${selectedEmail.starred ? 'fill-yellow-400 text-yellow-400' : 'text-gray-400'}`} />
@@ -794,13 +802,13 @@ function EmailViewPage({ selectedEmail, onBack, onToggleRead, onToggleStar }) {
 }
 
 // Email List View
-function EmailListView({ filteredEmails, activeFolder, onEmailClick, onToggleStar }) {
+function EmailListView({ filteredEmails, activeFolder, onEmailClick, onToggleStar, onRefresh }) {
   return (
     <>
       <div className="border-b border-gray-200 p-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <input type="checkbox" className="w-4 h-4 rounded" />
-          <button className="p-2 hover:bg-gray-100 rounded-full">
+          <button onClick={onRefresh} title="Refresh" className="p-2 hover:bg-gray-100 rounded-full">
             <RefreshCw className="w-5 h-5 text-gray-700" />
           </button>
           <button className="p-2 hover:bg-gray-100 rounded-full">
@@ -841,8 +849,8 @@ function EmailListView({ filteredEmails, activeFolder, onEmailClick, onToggleSta
                 onClick={(e) => e.stopPropagation()}
               />
               <button
-                onClick={(e) => onToggleStar(email.id || email.gmail_id, e)}
-                className="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                onClick={(e) => onToggleStar(email.id ?? email.gmail_id, e)}
+                className={`flex-shrink-0 ${email.starred ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity`}
               >
                 <Star className={`w-5 h-5 ${email.starred ? 'fill-yellow-400 text-yellow-400' : 'text-gray-400'}`} />
               </button>
@@ -874,6 +882,7 @@ export default function MailCo() {
   const [activeFolder, setActiveFolder] = useState('inbox');
   const [selectedEmail, setSelectedEmail] = useState(null);
   const [emails, setEmails] = useState([]);
+  const [searchQuery, setSearchQuery] = useState('');
   const [isComposeOpen, setIsComposeOpen] = useState(false);
   const [composeMinimized, setComposeMinimized] = useState(false);
 
@@ -928,17 +937,13 @@ export default function MailCo() {
     { id: 'analytics', name: 'Analytics', icon: BarChart3, page: 'analytics' },
   ];
 
-  // Load resume and campaigns on mount
+  // Load resume, campaigns, Gmail status, and emails on mount
   useEffect(() => {
     loadResume();
     loadCampaigns();
     checkGmailStatus();
     loadEmails();
   }, []);
-
-  useEffect(() => {
-    loadEmails();
-  }, [activeFolder]);
 
   const loadResume = async () => {
     try {
@@ -1067,6 +1072,7 @@ export default function MailCo() {
 
       alert(`Campaign sent! ${result.sent} emails sent, ${result.failed} failed.`);
       await loadCampaigns(); // Refresh campaigns
+      await loadEmails(); // Refresh sent folder counts and list
     } catch (error) {
       console.error('Error sending campaign:', error);
       alert(error.status ? `Error: ${error.message}` : 'Failed to send campaign');
@@ -1123,9 +1129,18 @@ export default function MailCo() {
     }
   };
 
+  const matchesEmailIdentifier = (emailObj, targetId) => {
+    if (!emailObj || targetId === undefined || targetId === null) return false;
+    const targetStr = String(targetId);
+    return (
+      (emailObj.id !== undefined && emailObj.id !== null && String(emailObj.id) === targetStr) ||
+      (emailObj.gmail_id !== undefined && emailObj.gmail_id !== null && String(emailObj.gmail_id) === targetStr)
+    );
+  };
+
   const loadEmails = async () => {
     try {
-      const data = await apiRequest(`/emails?folder=${activeFolder}`);
+      const data = await apiRequest('/emails?folder=all');
       if (Array.isArray(data)) {
         setEmails(data);
       }
@@ -1138,33 +1153,94 @@ export default function MailCo() {
   };
 
   const toggleStar = async (emailId, e) => {
-    e.stopPropagation();
+    if (e) e.stopPropagation();
+    if (emailId === undefined || emailId === null) return;
+
     try {
-      const data = await apiRequest(`/emails/${emailId}/star`, {
+      const data = await apiRequest(`/emails/${encodeURIComponent(emailId)}/star`, {
         method: 'POST',
       });
-      if (data) {
-        setEmails(emails.map(email =>
-          email.id === emailId || email.gmail_id === emailId
-            ? { ...email, starred: data.starred }
-            : email
-        ));
+      if (data && typeof data.starred === 'boolean') {
+        setEmails(prevEmails =>
+          prevEmails.map(email =>
+            matchesEmailIdentifier(email, emailId)
+              ? { ...email, starred: data.starred }
+              : email
+          )
+        );
+        setSelectedEmail(prevSelected =>
+          matchesEmailIdentifier(prevSelected, emailId)
+            ? { ...prevSelected, starred: data.starred }
+            : prevSelected
+        );
       }
     } catch (error) {
       console.error('Error toggling star:', error);
     }
   };
 
-  const toggleRead = (emailId) => {
-    setEmails(emails.map(email =>
-      email.id === emailId ? { ...email, read: !email.read } : email
-    ));
+  const toggleRead = async (emailId, explicitRead) => {
+    if (emailId === undefined || emailId === null) return;
+
+    const currentItem = emails.find(email => matchesEmailIdentifier(email, emailId)) ||
+      (matchesEmailIdentifier(selectedEmail, emailId) ? selectedEmail : null);
+    const previousRead = currentItem ? Boolean(currentItem.read) : false;
+    const nextRead = typeof explicitRead === 'boolean' ? explicitRead : !previousRead;
+
+    setEmails(prevEmails =>
+      prevEmails.map(email =>
+        matchesEmailIdentifier(email, emailId)
+          ? { ...email, read: nextRead }
+          : email
+      )
+    );
+    setSelectedEmail(prevSelected =>
+      matchesEmailIdentifier(prevSelected, emailId)
+        ? { ...prevSelected, read: nextRead }
+        : prevSelected
+    );
+
+    try {
+      const data = await apiRequest(`/emails/${encodeURIComponent(emailId)}/read`, {
+        method: 'POST',
+        body: typeof explicitRead === 'boolean' ? { read: explicitRead } : {},
+      });
+      if (data && typeof data.read === 'boolean') {
+        setEmails(prevEmails =>
+          prevEmails.map(email =>
+            matchesEmailIdentifier(email, emailId)
+              ? { ...email, read: data.read }
+              : email
+          )
+        );
+        setSelectedEmail(prevSelected =>
+          matchesEmailIdentifier(prevSelected, emailId)
+            ? { ...prevSelected, read: data.read }
+            : prevSelected
+        );
+      }
+    } catch (error) {
+      console.error('Error updating read status:', error);
+      setEmails(prevEmails =>
+        prevEmails.map(email =>
+          matchesEmailIdentifier(email, emailId)
+            ? { ...email, read: previousRead }
+            : email
+        )
+      );
+      setSelectedEmail(prevSelected =>
+        matchesEmailIdentifier(prevSelected, emailId)
+          ? { ...prevSelected, read: previousRead }
+          : prevSelected
+      );
+    }
   };
 
   const handleEmailClick = (email) => {
-    setSelectedEmail(email);
+    const emailKey = email.id ?? email.gmail_id;
+    setSelectedEmail({ ...email, read: true });
     if (!email.read) {
-      toggleRead(email.id);
+      toggleRead(emailKey, true);
     }
   };
 
@@ -1210,10 +1286,21 @@ export default function MailCo() {
   };
 
   const getFilteredEmails = () => {
-    if (activeFolder === 'starred') {
-      return emails.filter(e => e.starred);
+    const byFolder = activeFolder === 'starred'
+      ? emails.filter(e => e.starred)
+      : emails.filter(e => e.folder === activeFolder);
+
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) {
+      return byFolder;
     }
-    return emails.filter(e => e.folder === activeFolder);
+
+    return byFolder.filter(e =>
+      (e.subject || '').toLowerCase().includes(query) ||
+      (e.sender || '').toLowerCase().includes(query) ||
+      (e.email || '').toLowerCase().includes(query) ||
+      (e.body || '').toLowerCase().includes(query)
+    );
   };
 
   const filteredEmails = getFilteredEmails();
@@ -1301,6 +1388,8 @@ export default function MailCo() {
               <input
                 type="text"
                 placeholder="Search mail"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
                 className="flex-1 bg-transparent outline-none text-gray-700"
               />
             </div>
@@ -1310,6 +1399,7 @@ export default function MailCo() {
             activeFolder={activeFolder}
             onEmailClick={handleEmailClick}
             onToggleStar={toggleStar}
+            onRefresh={loadEmails}
           />
         </>
       );
